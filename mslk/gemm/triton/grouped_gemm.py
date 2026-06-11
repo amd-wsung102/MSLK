@@ -1216,9 +1216,13 @@ def _mslk_grouped_gemm_dgrad(
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
+    # Keep tile counters in int64. M_sizes is int64 (required by the op), so
+    # num_tiles is int64; iterated_tiles must match to stay type-stable across
+    # the `if m_size > 0` block (Triton forbids dtype changes across blocks).
     iterated_tiles = 0
+    iterated_tiles = iterated_tiles.to(tl.int64)  # pyre-ignore
     for g in tl.range(G):
-        m_size = tl.load(m_sizes + g)
+        m_size = tl.load(m_sizes + g).to(tl.int64)
         if m_size > 0:
             M_start_offset = M_end_offset
             M_end_offset = M_start_offset + m_size
@@ -1290,6 +1294,13 @@ def _mslk_grouped_gemm_dgrad(
 @triton.autotune(
     configs=_AMD_WGRAD_CONFIGS,
     key=["G", "M_BUCKET", "N", "K", "OUTPUT_ACCUM"],
+    # When OUTPUT_ACCUM is set the kernel does an in-place read-modify-write
+    # (output += dW). The autotuner benchmarks each config by invoking the
+    # kernel many times on the *same* buffer, which would otherwise compound
+    # the accumulation and corrupt the user's output. restore_value snapshots
+    # the buffer before each trial and restores it (including before the final
+    # real launch), so accumulation happens exactly once.
+    restore_value=["c_ptr"],
 )
 @triton.jit
 def _mslk_grouped_gemm_wgrad(
@@ -1311,9 +1322,12 @@ def _mslk_grouped_gemm_wgrad(
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
+    # Keep tile counters in int64 for type-stability across the `if m_size > 0`
+    # block (M_sizes is int64; see dgrad kernel note).
     iterated_tiles = 0
+    iterated_tiles = iterated_tiles.to(tl.int64)  # pyre-ignore
     for g in tl.range(G):
-        m_size = tl.load(m_sizes + g)
+        m_size = tl.load(m_sizes + g).to(tl.int64)
         if m_size > 0:
             M_start_offset = M_end_offset
             M_end_offset = M_start_offset + m_size
