@@ -117,16 +117,26 @@ def test_backward(  # noqa: C901
             "(same root cause as CK's own bf16 backward skip below)!"
         )
 
-    op_fw = (
-        sample_random_supported_fw(
-            fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
-            ALL_FW_OPS,
-            seed=q_len * kv + kv_len * k,
-            op_bw=op_bw,
+    try:
+        op_fw = (
+            sample_random_supported_fw(
+                fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
+                ALL_FW_OPS,
+                seed=q_len * kv + kv_len * k,
+                op_bw=op_bw,
+            )
+            if op_bw != fmha.cutlass.BwOp
+            else fmha.cutlass.FwOp
         )
-        if op_bw != fmha.cutlass.BwOp
-        else fmha.cutlass.FwOp
-    )
+    except NotImplementedError:
+        if op_bw != fmha.flydsl.BwOp:
+            raise
+        # flydsl.BwOp ships no forward of its own and is paired with ck.FwOp,
+        # so its reachable shapes are bounded by that forward's coverage rather
+        # than by the backward kernel. Where no forward can serve the inputs
+        # the backward simply cannot be exercised -- skip instead of failing,
+        # which would otherwise report a forward-side gap as a backward bug.
+        pytest.skip("No forward operator supports these inputs for flydsl.BwOp")
 
     if op_bw == fmha.flydsl.BwOp:
         # op_fw is already pinned to fmha.ck.FwOp by sample_random_supported_fw's
