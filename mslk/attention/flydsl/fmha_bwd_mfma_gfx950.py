@@ -100,6 +100,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     deterministic: bool = False,
     ck_scope_dvdk: bool = False,
     has_bias: bool = False,
+    emit_dbias: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -383,6 +384,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_b: fx.Int32,
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
+        dBias: fx.Tensor,
+        dbias_sink: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -577,6 +580,24 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_rsrc = _bops.create_buffer_resource(Bias)
             bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
                 bias_stride_h
+            )
+        # dBias is the gradient w.r.t. that bias. Since S_total = scale*QK +
+        # Bias, dL/dBias is dL/dS_total, which is exactly the UNSCALED dS the
+        # epilogue already computes -- `scale` belongs only to the dQ/dK GEMMs.
+        # No reduction is needed because broadcast bias is rejected host-side,
+        # and no atomics because each (b, h, m, n) is produced by exactly one
+        # lane of the one block owning that n-tile. dBias is contiguous
+        # [B, H, Mq, Mk] with one extra trailing sink element that masked-off
+        # tail lanes write to instead of running off the plane.
+        if const_expr(emit_dbias):
+            dbias_rsrc = _bops.create_buffer_resource(dBias)
+            # dBias is allocated contiguous by the host, so its pitches come
+            # from the kernel's own dims rather than the input bias strides --
+            # the input may be non-contiguous in B/H and only guarantees a unit
+            # last-dim stride. A tensor bias is never varlen, so seq_M/seq_N are
+            # the true per-batch extents here.
+            dbias_plane_base = (
+                (batch_idx * n_heads_idx + head_idx) * seq_M_idx * seq_N_idx
             )
 
         from flydsl._mlir import ir as _ir_d
@@ -1602,6 +1623,26 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             )
                                             m_local = m_within + (m_sub * 32)
                                             n_local = n_within
+                                            if const_expr(emit_dbias):
+                                                # m_row_abs/n_row_abs are only bound on
+                                                # the P pass, so recompute here rather
+                                                # than read a stale value left over from
+                                                # the last P-pass iteration.
+                                                db_off_ok = fx.Int32(
+                                                    dbias_plane_base
+                                                    + (m_local + m_start) * seq_N_idx
+                                                    + (n_local + n_start)
+                                                )
+                                                _bops.buffer_store(
+                                                    _raw(ds_val),
+                                                    dbias_rsrc,
+                                                    fx.Index(
+                                                        valid_mn.select(
+                                                            db_off_ok,
+                                                            fx.Int32(dbias_sink),
+                                                        )
+                                                    ),
+                                                )
                                             # Default [n,m] m-contiguous store, UNLESS _use_ds_tr
                                             # (paired with the ds_read_tr A-operand read below --
                                             # _dq_ds_pack_gemm4_tr) -- then use the
@@ -2035,6 +2076,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_b: fx.Int32,
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
+        dBias: fx.Tensor,
+        dbias_sink: fx.Int32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2077,6 +2120,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_stride_b,
             bias_stride_h,
             bias_stride_q,
+            dBias,
+            dbias_sink,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),

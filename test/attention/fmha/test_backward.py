@@ -105,6 +105,18 @@ def test_backward(  # noqa: C901
     scale = None
     if op_bw.SUPPORTS_CUSTOM_SCALE and query.shape[-1] < 32:
         scale = (1 / 32) ** 0.5
+    if op_bw == fmha.flydsl.BwOp and dtype == torch.bfloat16:
+        # Hoisted above the forward-op selection below: this case is skipped
+        # unconditionally (see the reason in the flydsl block further down), and
+        # sample_random_supported_fw raises NotImplementedError rather than
+        # skipping when no forward op can serve the inputs -- which it cannot
+        # for some tensor-bias shapes. Selecting a forward op we are about to
+        # throw away must not be able to fail the test.
+        pytest.skip(
+            "FlyDSL Fmha backward for bfloat16 has a known precision tail "
+            "(same root cause as CK's own bf16 backward skip below)!"
+        )
+
     op_fw = (
         sample_random_supported_fw(
             fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
