@@ -692,6 +692,50 @@ def _num_kv_heads(key: torch.Tensor) -> int:
     return 1 if key.stride(2) == 0 else key.shape[2]
 
 
+def _tensor_bias_bwd_reasons(d: Inputs) -> List[str]:
+    """Constraints on an additive tensor bias in the FlyDSL backward.
+
+    The broadcast rejection is ported from ck.BwOp: backprop through a
+    broadcast bias is declined outright rather than silently mis-reduced, so
+    the bias must already be materialised at the full attention shape. On top
+    of that, the kernel addresses the plane as `m*stride(2) + n`, which assumes
+    a unit last-dim stride, and loads bias elements as the query dtype.
+
+    Query is always BMHK here -- `not_supported_reasons` indexes
+    `d.query.shape[2]` unconditionally, and SUPPORTS_BMGHK is False.
+    """
+    bias = d.attn_bias
+    assert isinstance(bias, torch.Tensor)
+    reasons: List[str] = []
+    gpu_arch = torch.cuda.get_device_properties(d.query.device).gcnArchName
+    if "gfx950" not in gpu_arch:
+        reasons.append(
+            f"a tensor `attn_bias` is implemented for gfx950 only (got {gpu_arch})"
+        )
+    expected_bias_shape = (
+        d.query.shape[0],
+        d.query.shape[2],
+        d.query.shape[1],
+        d.key.shape[1],
+    )
+    if tuple(bias.shape) != expected_bias_shape:
+        reasons.append(
+            "Broadcasting the `attn_bias` tensor is not supported "
+            f"(shape: {tuple(bias.shape)}"
+            f"/ expected: {expected_bias_shape})"
+        )
+    elif bias.stride(-1) != 1:
+        reasons.append(
+            "`attn_bias` must be contiguous in its last dimension "
+            f"(stride(-1) = {bias.stride(-1)})"
+        )
+    if bias.dtype != d.query.dtype:
+        reasons.append(
+            f"attn_bias dtype {bias.dtype} must match query dtype {d.query.dtype}"
+        )
+    return reasons
+
+
 # Cache of flyc.compile()'d kernels, keyed on the compile-time-constant params
 # baked into the kernel body (D, dtype, tile sizes, scale, causal, GQA ratio,
 # varlen). `flyc.compile()`'s underlying MLIR/LLVM artifact is itself cached
@@ -730,6 +774,7 @@ def _flydsl_bwd(
     causal: bool,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
+    attn_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
@@ -853,6 +898,31 @@ def _flydsl_bwd(
     _seqstart_q_arg = seqstart_q if varlen else _dummy_seqstart
     _seqstart_k_arg = seqstart_k if varlen else _dummy_seqstart
 
+    # Additive tensor bias. The kernel reads a dense [B, H, Mq, Mk] plane with a
+    # unit last-dim stride; broadcast shapes and non-unit row pitch are rejected
+    # in BwOp.not_supported_reasons, so the strides below fully describe it.
+    # has_bias is part of the compile key: a biased and an unbiased launch must
+    # never share a cached CompiledFunction, since it gates whether the kernel
+    # emits the bias load at all.
+    has_bias = attn_bias is not None
+    if has_bias and not _is_gfx950:
+        # Only the gfx950 fused kernel reads a bias so far; the gfx942 fused and
+        # split dvdk/dq kernels would silently recompute P without it, which
+        # corrupts dQ/dK/dV rather than just omitting db. BwOp declines a tensor
+        # bias off gfx950, so this is a backstop for direct op callers.
+        raise NotImplementedError(
+            "mslk_flydsl::fmha_bwd does not support attn_bias on "
+            f"{gpu_arch}; the tensor-bias backward is implemented for gfx950 only."
+        )
+    _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
+    _bias_arg = attn_bias if has_bias else _dummy_bias
+    if attn_bias is not None:
+        bias_stride_b = attn_bias.stride(0)
+        bias_stride_h = attn_bias.stride(1)
+        bias_stride_q = attn_bias.stride(2)
+    else:
+        bias_stride_b = bias_stride_h = bias_stride_q = 0
+
     # gfx950 production path (mslk.attention.flydsl.fmha_bwd_mfma_gfx950),
     # replacing the older fmha_bwd_mfma.py dqdkdv kernel on this arch (gfx942
     # is untouched below -- this kernel hard-asserts gfx950). The kernel
@@ -894,6 +964,10 @@ def _flydsl_bwd(
             _seqstart_q_arg,
             _seqstart_k_arg,
             total_m,
+            _bias_arg,
+            bias_stride_b,
+            bias_stride_h,
+            bias_stride_q,
             stream,
         )
         gfx950_key = (
@@ -906,6 +980,7 @@ def _flydsl_bwd(
             causal,
             heads_per_kv,
             varlen,
+            has_bias,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -921,6 +996,7 @@ def _flydsl_bwd(
                 gpu_arch=gpu_arch,
                 deterministic=False,
                 ck_scope_dvdk=True,
+                has_bias=has_bias,
             )
             # flyc.compile executes the kernel once (JIT warm run) -- dQ (and
             # dV/dK, always atomic-add under ck_scope_dvdk's per-query-head
@@ -951,6 +1027,10 @@ def _flydsl_bwd(
                 _seqstart_q_arg,
                 _seqstart_k_arg,
                 total_m,
+                _bias_arg,
+                bias_stride_b,
+                bias_stride_h,
+                bias_stride_q,
                 stream,
             )
             compiled_gfx950 = flyc.compile(launch_gfx950, *args_compile)
@@ -1271,6 +1351,7 @@ def _flydsl_bwd_abstract(
     causal: bool,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
+    attn_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(query),
@@ -1333,6 +1414,7 @@ class BwOp(AttentionBwOpBase):
     # semantics) -- separately scoped, not implemented.
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
+        torch.Tensor,
         LowerTriangularMask,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
@@ -1364,6 +1446,8 @@ class BwOp(AttentionBwOpBase):
             reasons.append(
                 "query head count must be a multiple of the KV head count (GQA)"
             )
+        if isinstance(d.attn_bias, torch.Tensor):
+            reasons.extend(_tensor_bias_bwd_reasons(d))
         return reasons
 
     @classmethod
@@ -1393,6 +1477,7 @@ class BwOp(AttentionBwOpBase):
             causal,
             seqstart_q,
             seqstart_k,
+            inp.attn_bias if isinstance(inp.attn_bias, torch.Tensor) else None,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see
