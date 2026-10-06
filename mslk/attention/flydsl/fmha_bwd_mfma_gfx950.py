@@ -569,33 +569,19 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         v_rsrc = _bops.create_buffer_resource(V)
         do_rsrc = _bops.create_buffer_resource(dO)
 
-        # Additive tensor bias: the forward computed S_total = scale*QK + Bias,
-        # so LSE already carries the bias and P cannot be recomputed here
-        # without it. Bias is a dense [B, H, Mq, Mk] plane -- broadcast shapes
-        # are rejected host-side, matching ck.BwOp -- indexed by the absolute
-        # (m_row_abs, n_row_abs) the softmax site already has in hand. A plain
-        # tensor bias is never varlen, so the plane base needs no seqstart
-        # lookup.
+        # The forward folded Bias into LSE, so P cannot be recomputed without it.
+        # Dense [B, H, Mq, Mk]; broadcast shapes are rejected host-side.
         if const_expr(has_bias):
             bias_rsrc = _bops.create_buffer_resource(Bias)
             bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
                 bias_stride_h
             )
-        # dBias is the gradient w.r.t. that bias. Since S_total = scale*QK +
-        # Bias, dL/dBias is dL/dS_total, which is exactly the UNSCALED dS the
-        # epilogue already computes -- `scale` belongs only to the dQ/dK GEMMs.
-        # No reduction is needed because broadcast bias is rejected host-side,
-        # and no atomics because each (b, h, m, n) is produced by exactly one
-        # lane of the one block owning that n-tile. dBias is contiguous
-        # [B, H, Mq, Mk] with one extra trailing sink element that masked-off
-        # tail lanes write to instead of running off the plane.
+        # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
+        # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
         if const_expr(emit_dbias):
             dbias_rsrc = _bops.create_buffer_resource(dBias)
-            # dBias is allocated contiguous by the host, so its pitches come
-            # from the kernel's own dims rather than the input bias strides --
-            # the input may be non-contiguous in B/H and only guarantees a unit
-            # last-dim stride. A tensor bias is never varlen, so seq_M/seq_N are
-            # the true per-batch extents here.
+            # dBias is host-allocated contiguous, so its pitches come from the kernel's
+            # own dims, not the input strides, which may be non-contiguous in B/H.
             dbias_plane_base = (
                 (batch_idx * n_heads_idx + head_idx) * seq_M_idx * seq_N_idx
             )
@@ -1309,10 +1295,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
                 log2e_scale_cst = fx.Float32(_LOG2E * scale)
                 scale_cst = fx.Float32(scale)
-                # _softmax_p folds `scale` into its single FMA, so a bias is
-                # applied as bias/scale on the raw QK accumulator rather than
-                # by restructuring the exponent -- same trick the forward uses
-                # (flash_attn_utils.py's add_bias / c_inv_sm_scale).
+                # _softmax_p folds scale into one FMA, so apply the bias as
+                # bias/scale on the raw QK accumulator (the forward's trick).
                 if const_expr(has_bias):
                     inv_scale_cst = fx.Float32(1.0 / scale)
                 for m_sub in range_constexpr(M_SUBTILES):
@@ -1624,10 +1608,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             m_local = m_within + (m_sub * 32)
                                             n_local = n_within
                                             if const_expr(emit_dbias):
-                                                # m_row_abs/n_row_abs are only bound on
-                                                # the P pass, so recompute here rather
-                                                # than read a stale value left over from
-                                                # the last P-pass iteration.
+                                                # Bound only on the P pass;
+                                                # recompute, don't reuse.
                                                 db_off_ok = fx.Int32(
                                                     dbias_plane_base
                                                     + (m_local + m_start) * seq_N_idx

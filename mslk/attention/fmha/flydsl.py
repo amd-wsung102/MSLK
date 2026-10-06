@@ -899,18 +899,12 @@ def _flydsl_bwd(
     _seqstart_q_arg = seqstart_q if varlen else _dummy_seqstart
     _seqstart_k_arg = seqstart_k if varlen else _dummy_seqstart
 
-    # Additive tensor bias. The kernel reads a dense [B, H, Mq, Mk] plane with a
-    # unit last-dim stride; broadcast shapes and non-unit row pitch are rejected
-    # in BwOp.not_supported_reasons, so the strides below fully describe it.
-    # has_bias is part of the compile key: a biased and an unbiased launch must
-    # never share a cached CompiledFunction, since it gates whether the kernel
-    # emits the bias load at all.
+    # Dense [B, H, Mq, Mk] with unit last-dim stride; other layouts are rejected
+    # in BwOp.not_supported_reasons. has_bias is part of the compile key.
     has_bias = attn_bias is not None
     if has_bias and not _is_gfx950:
-        # Only the gfx950 fused kernel reads a bias so far; the gfx942 fused and
-        # split dvdk/dq kernels would silently recompute P without it, which
-        # corrupts dQ/dK/dV rather than just omitting db. BwOp declines a tensor
-        # bias off gfx950, so this is a backstop for direct op callers.
+        # Off gfx950 the kernels recompute P without the bias, corrupting dQ/dK/dV
+        # rather than just omitting db. BwOp declines it; this backstops direct callers.
         raise NotImplementedError(
             "mslk_flydsl::fmha_bwd does not support attn_bias on "
             f"{gpu_arch}; the tensor-bias backward is implemented for gfx950 only."
@@ -924,10 +918,8 @@ def _flydsl_bwd(
     else:
         bias_stride_b = bias_stride_h = bias_stride_q = 0
 
-    # dBias scratch: contiguous [B, H, M, N] in f32 plus one trailing sink
-    # element that masked-off tail lanes store into, so a partial tile never
-    # writes past its plane. f32 rather than the bias dtype because the kernel
-    # produces dS in f32; the cast back happens once, below.
+    # Contiguous [B, H, M, N] f32 plus a trailing sink for masked-off tail lanes;
+    # f32 because the kernel produces dS in f32, cast back once below.
     emit_dbias = has_bias and needs_dbias
     if emit_dbias:
         dbias_sink = B * H * M * N
