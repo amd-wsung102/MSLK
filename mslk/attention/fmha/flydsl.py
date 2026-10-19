@@ -111,17 +111,14 @@ _WINDOW_BIAS_TYPES = (
     BlockDiagonalCausalLocalAttentionFromBottomRightMask,
 )
 
-# Causal alignment tri-state, mirroring ck.py's _CustomMaskType and the
-# CAUSAL_* constants in fmha_bwd_mfma.py. Duplicated rather than imported:
-# that module pulls in FlyDSL, which this one must not do at import time.
+# Causal tri-state mirroring ck.py's _CustomMaskType and fmha_bwd_mfma.py's
+# CAUSAL_* constants. Duplicated: importing it would pull FlyDSL in eagerly.
 CAUSAL_NONE = 0
 CAUSAL_TOP_LEFT = 1
 CAUSAL_BOTTOM_RIGHT = 2
 
-# Causal alignment groupings for the backward's tri-state. Disjoint by
-# construction: BlockDiagonalCausalFromBottomRightMask derives from
-# BlockDiagonalMask, not BlockDiagonalCausalMask, and
-# LowerTriangularFromBottomRightMask derives from AttentionBias directly.
+# Disjoint by construction: BlockDiagonalCausalFromBottomRightMask derives
+# from BlockDiagonalMask, and LowerTriangularFromBottomRightMask from AttentionBias.
 _TOP_LEFT_CAUSAL_TYPES = (
     LowerTriangularMask,
     LowerTriangularMaskWithTensorBias,
@@ -1488,11 +1485,8 @@ class BwOp(AttentionBwOpBase):
     # (never seqstart-global), which already implements per-block causal
     # masking correctly given per-batch tiling -- confirmed via
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
-    # Bottom-right alignment is the causal_mode tri-state's second mode, which
-    # shifts the diagonal to the end of both sequences. Top-left local
-    # attention adds its lower window edge to the top-left causal geometry;
-    # the bottom-right LOCAL types stay out because the window term is still
-    # expressed against the top-left diagonal.
+    # Bottom-right is the tri-state's second mode. The bottom-right LOCAL
+    # types stay out: the window term still uses the top-left diagonal.
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,

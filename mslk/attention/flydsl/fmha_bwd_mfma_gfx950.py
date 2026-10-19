@@ -1567,8 +1567,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                 causal_mode == CAUSAL_BOTTOM_RIGHT
                                             ):
                                                 # Diagonal pinned to the end of
-                                                # both sequences; additive form
-                                                # avoids an unsigned wrap.
+                                                # both sequences; no unsigned wrap.
                                                 valid_mn = valid_mn & (
                                                     n_row_abs + this_seqlen_q
                                                     <= m_row_abs + this_seqlen_k

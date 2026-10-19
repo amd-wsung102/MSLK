@@ -596,9 +596,8 @@ def compile_fmha_bwd_dvdk_mfma(
                         if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                             valid_mn = valid_mn & (n_row_abs <= m_row_abs)
                         if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
-                            # Bottom-right pins the diagonal to the end of both sequences:
-                            # n - seqlen_k <= m - seqlen_q, written additively so the
-                            # unsigned index arithmetic cannot wrap.
+                            # Diagonal pinned to the end of both sequences;
+                            # additive form avoids an unsigned index wrap.
                             valid_mn = valid_mn & (
                                 n_row_abs + this_seqlen_q <= m_row_abs + this_seqlen_k
                             )
@@ -1177,9 +1176,8 @@ def compile_fmha_bwd_dq_mfma(
         # cutting both wasted MFMA and redundant per-N-tile K/V HBM reloads roughly
         # in half for causal shapes -- same magnitude win as compile_fmha_bwd_dqdkdv_mfma's
         # original causal skip-ahead finding.
-        # Top-left only: bottom-right shifts the diagonal DOWN by
-        # seqlen_k - seqlen_q, so this bound would skip live tiles.
-        # Correctness first -- bottom-right sweeps the full range.
+        # Top-left only: bottom-right shifts the diagonal down, so this
+        # bound would skip live tiles. Full range there, correctness first.
         if const_expr(causal_mode == CAUSAL_TOP_LEFT):
             n_tile_end_raw = (m_start + fx.Index(BLOCK_M) - fx.Index(1)) // fx.Index(
                 BLOCK_N
@@ -1315,9 +1313,8 @@ def compile_fmha_bwd_dq_mfma(
                     if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                         valid_mn = valid_mn & (n_row_abs <= m_row_abss[r])
                     if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
-                        # Bottom-right pins the diagonal to the end of both sequences:
-                        # n - seqlen_k <= m - seqlen_q, written additively so the
-                        # unsigned index arithmetic cannot wrap.
+                        # Diagonal pinned to the end of both sequences;
+                        # additive form avoids an unsigned index wrap.
                         valid_mn = valid_mn & (
                             n_row_abs + this_seqlen_q <= m_row_abss[r] + this_seqlen_k
                         )
@@ -2174,9 +2171,8 @@ def compile_fmha_bwd_dqdkdv_mfma(
                             if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                                 valid_mn = valid_mn & (n_row_abs <= m_row_abs)
                             if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
-                                # Bottom-right pins the diagonal to the end of both sequences:
-                                # n - seqlen_k <= m - seqlen_q, written additively so the
-                                # unsigned index arithmetic cannot wrap.
+                                # Diagonal pinned to the end of both sequences;
+                                # additive form avoids an unsigned index wrap.
                                 valid_mn = valid_mn & (
                                     n_row_abs + this_seqlen_q
                                     <= m_row_abs + this_seqlen_k
