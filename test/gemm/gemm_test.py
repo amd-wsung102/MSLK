@@ -3013,6 +3013,52 @@ class BF16Tests(unittest.TestCase):
             )
 
 
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(9)
+class BF16GroupedGradGraphCaptureTests(unittest.TestCase):
+    """The grouped grad/wgrad ops must be capturable in a CUDA graph, which is
+    how gemm_bench times them."""
+
+    G, M, N, K = 8, 2048, 1024, 512
+
+    def _m_sizes(self) -> torch.Tensor:
+        return BF16Tests.generate_random_splits(
+            self.G, self.M, min_group_size=8
+        ).to(torch.int64)
+
+    def _check_replay(self, fn) -> None:
+        expected = fn()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected)
+
+    def test_grad(self) -> None:
+        torch.manual_seed(0)
+        device = torch.accelerator.current_accelerator()
+        dy = torch.randn((self.M, self.N), dtype=torch.bfloat16, device=device)
+        w = torch.randn((self.G, self.N, self.K), dtype=torch.bfloat16, device=device)
+        m_sizes = self._m_sizes()
+        self._check_replay(
+            lambda: torch.ops.mslk.bf16bf16bf16_grouped_grad(
+                dy, w.permute(0, 2, 1), m_sizes
+            )
+        )
+
+    def test_wgrad(self) -> None:
+        torch.manual_seed(0)
+        device = torch.accelerator.current_accelerator()
+        dy = torch.randn((self.M, self.N), dtype=torch.bfloat16, device=device)
+        x = torch.randn((self.M, self.K), dtype=torch.bfloat16, device=device)
+        m_sizes = self._m_sizes()
+        self._check_replay(
+            lambda: torch.ops.mslk.bf16bf16bf16_grouped_wgrad(dy, x, m_sizes)
+        )
+
+
 @skipUnlessCuda()
 @skipUnlessCudaCapability(10)
 class NVFP4Tests(unittest.TestCase):
@@ -4243,6 +4289,26 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+    @parameterized.expand([(4, 1, 1280, 8192), (2, 128, 7424, 8192)])
+    def test_op_takes_plain_weights(self, B: int, M: int, N: int, K: int) -> None:
+        # mslk::f8f8bf16_rowwise_batched takes row-major weights on every
+        # backend; the FlyDSL override must shuffle them itself.
+        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+
+        out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+
+        # Reference from the dequantized FP8 operands: outputs are ~0.1, so the
+        # loose bf16-input tolerance above would accept a misread weight layout.
+        ref = torch.bmm(
+            xq.float() * x_scale.view(B, M, 1),
+            (wq.float() * w_scale.view(B, N, 1)).transpose(1, 2),
+        )
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
 
 
 @skipUnlessRocm()
