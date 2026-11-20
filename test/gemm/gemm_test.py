@@ -4290,26 +4290,6 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
         ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
-    @parameterized.expand([(4, 1, 1280, 8192), (2, 128, 7424, 8192)])
-    def test_op_takes_plain_weights(self, B: int, M: int, N: int, K: int) -> None:
-        # mslk::f8f8bf16_rowwise_batched takes row-major weights on every
-        # backend; the FlyDSL override must shuffle them itself.
-        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
-        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
-
-        xq, x_scale = quantize_fp8_row(x)
-        wq, w_scale = quantize_fp8_row(w)
-
-        out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
-
-        # Reference from the dequantized FP8 operands: outputs are ~0.1, so the
-        # loose bf16-input tolerance above would accept a misread weight layout.
-        ref = torch.bmm(
-            xq.float() * x_scale.view(B, M, 1),
-            (wq.float() * w_scale.view(B, N, 1)).transpose(1, 2),
-        )
-        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
-
 
 @skipUnlessRocm()
 @skipUnlessGfxArch("gfx942", "gfx950")

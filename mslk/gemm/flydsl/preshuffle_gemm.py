@@ -861,12 +861,7 @@ if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
                 ref, cached_version, shuf = entry
                 if ref() is WQ and cached_version == version and shuf.shape == WQ.shape:
                     return shuf
-            if WQ.dim() == 3:
-                # Shuffling [B*N, K] equals shuffling each batch: flydsl_preshuffle
-                # requires N % 16 == 0, so no 16-row block spans two batches.
-                shuf = flydsl_preshuffle(WQ.reshape(-1, WQ.shape[-1])).view(WQ.shape)
-            else:
-                shuf = flydsl_preshuffle(WQ)
+            shuf = flydsl_preshuffle(WQ)
             if version is not None:
                 ref = weakref.ref(WQ, lambda r, k=key: _evict(r, k))
                 _preshuffle_cache[key] = (ref, version, shuf)
@@ -957,8 +952,11 @@ if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
                     dtype=torch.float16,
                 )
 
-        # --- batched op ---
-        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
+    # --- batched op ---
+    if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
+        from mslk.flydsl.common import is_flydsl_available as _is_flydsl_batched
+
+        if _is_flydsl_batched():
 
             @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
             def _f8f8bf16_rowwise_batched_flydsl(
@@ -974,11 +972,9 @@ if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
                     raise NotImplementedError(
                         "FlyDSL batched preshuffle GEMM does not support bias"
                     )
-                # The op takes plain row-major weights, like its CUTLASS and CK
-                # implementations; the kernel reads the preshuffled layout.
                 return flydsl_preshuffle_batched_gemm(
                     XQ,
-                    _get_preshuffled(WQ),
+                    WQ,
                     x_scale,
                     w_scale,
                     out=output,
